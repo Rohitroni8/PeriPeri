@@ -1,0 +1,14 @@
+{
+  "name": "relaydesk-shared-inbox",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.0" },
+  "scripts": {
+    "start": "node app.mjs",
+    "sync:numbers": "node sync-numbers.mjs"
+  },
+  "dependencies": {
+    "mysql2": "3.24.6"
+  }
+}
