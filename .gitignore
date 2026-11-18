@@ -4,3 +4,5 @@ data/
 node_modules/
 *.sqlite-shm
 *.sqlite-wal
+backups/
+*.ndjson.gz
