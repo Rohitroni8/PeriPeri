@@ -2,60 +2,76 @@
 
 ## Target setup
 
-- Hosting: Hostinger Business Web / hPanel
-- App hostname: `inbox.elitegoldsignal.com` (recommended)
-- Database: Hostinger MySQL, kept outside deployment files
+- Hosting: Hostinger Business Web, managed through hPanel
+- App hostname: `inbox.elitegoldsignal.com`, set up as its own Node.js web app. Do not replace the main site, and do not change MX records (Business Email must keep working).
+- Database: Hostinger MySQL
 - WhatsApp: the new number connected directly to Meta Cloud API
-- Access: one administrator account for the initial release
+- Access: one administrator account
 
-Keep the existing apex website and Business Email service. Add the app as its own subdomain site, enable HTTPS, and leave existing MX records unchanged.
+## Status
 
-## What is already prepared
+The code has passed its end-to-end test suite against a local MariaDB 10.11 database with a mocked Meta API (`npm test`). It has **not** yet been deployed, or tested against the real Meta API, a real number or Hostinger's database.
 
-- Node.js app with one administrator login, secure session cookies, webhook signature validation, idempotent inbound message storage, text replies, conversation state, and paginated WABA phone sync.
-- MySQL storage for app records and sessions. Tables are created at startup.
-- Production environment template in `.env.example`.
+## 1. Hostinger (you)
 
-The app has not been deployed. It is a controlled pilot candidate after the checklist below. It is not a full Periskope feature replacement and does not yet include approved template messages, media handling, multi-admin roles, conversation assignment, automated database backups/retention, or a job queue.
+1. **MySQL:** in hPanel → Databases, create a database and a user with full privileges on it. Note the name, user and password; you'll enter them only into hPanel in step 3.
+2. **Subdomain app:** in hPanel, add a Node.js web app for `inbox.elitegoldsignal.com`:
+   - Node.js version 22.x or newer.
+   - Upload `relaydesk-hostinger.zip`.
+   - Set the start command to `npm start`; Hostinger runs `npm install` from `package.json` and `package-lock.json`.
+3. **Environment variables:** enter these in the app settings (never in files or chat):
 
-## Hostinger prerequisites
+   | Variable | Value |
+   |---|---|
+   | `NODE_ENV` | `production` |
+   | `TRUST_PROXY` | `true` |
+   | `COOKIE_SECURE` | `true` |
+   | `ADMIN_EMAIL` | your admin email |
+   | `ADMIN_PASSWORD` | unique, 16+ characters |
+   | `DB_HOST` / `DB_PORT` | `127.0.0.1` / `3306` |
+   | `DB_NAME` / `DB_USER` / `DB_PASSWORD` | from step 1 |
+   | `WA_VERIFY_TOKEN` | a new long random string you invent |
+   | `META_APP_SECRET` | Meta App Dashboard → App settings → Basic |
+   | `WA_BUSINESS_ACCOUNT_ID` | WABA ID (WhatsApp Manager / API Setup) |
+   | `WA_ACCESS_TOKEN` | **System User** token (permanent), with `whatsapp_business_messaging` and `whatsapp_business_management` |
+   | `WA_GRAPH_API_VERSION` | e.g. `v23.0`. Use the version shown in your Meta app. |
+   | `BACKUP_DIR` | a folder **outside** the app folder, e.g. `/home/<user>/relaydesk-backups` |
 
-1. In hPanel, create a MySQL database and database user. Grant that user access to the database with privileges to create tables and indexes. Keep the database password private.
-2. Create `inbox.elitegoldsignal.com` as a separate Node.js web app. Do not replace the apex site.
-3. Choose Node.js 22.x or 24.x and upload the contents of `relaydesk-integration` as a ZIP. Keep `.env` and any real credentials out of the ZIP.
-4. Set the start command to `npm start`. Hostinger installs dependencies from `package.json` during deployment.
-5. Add these environment variables in the Hostinger app settings:
+4. **Check health:** enable SSL for the subdomain. Then open `https://inbox.elitegoldsignal.com/health`. You should see `"database":"ok"`, `"whatsapp_configured":true` and `"webhook_configured":true`.
 
-   - `NODE_ENV=production`
-   - `COOKIE_SECURE=true`
-   - `ADMIN_EMAIL=<your admin email>`
-   - `ADMIN_PASSWORD=<unique password, 16+ characters>`
-   - `DB_HOST=127.0.0.1`
-   - `DB_PORT=3306`
-   - `DB_NAME=<database name>`
-   - `DB_USER=<database username>`
-   - `DB_PASSWORD=<database password>`
-   - `WA_VERIFY_TOKEN=<new random secret created for this webhook>`
-   - `META_APP_SECRET=<Meta app secret>`
-   - `WA_BUSINESS_ACCOUNT_ID=<WABA ID>`
-   - `WA_ACCESS_TOKEN=<production system-user token>`
-   - `WA_GRAPH_API_VERSION=<version enabled for your Meta app>`
+## 2. Meta (you)
 
-   Hostinger's Node.js MySQL guide specifies `127.0.0.1` and port `3306` for its local database connection. Use the live version shown in your Meta app rather than copying a version string from an old example.
+1. In WhatsApp Manager, add the new number to the WABA, verify it with the code, and register it for Cloud API.
+2. Create a System User (Business Settings → Users → System users) and give it the WhatsApp app and WABA assets. Generate a token with the two permissions above. Don't use the 24-hour test token.
+3. In App Dashboard → WhatsApp → Configuration, set:
+   - Callback URL: `https://inbox.elitegoldsignal.com/webhooks/whatsapp`
+   - Verify token: the same `WA_VERIFY_TOKEN`
 
-6. Deploy and open `https://inbox.elitegoldsignal.com/health`. It should report database connectivity without returning secrets. Sign in and confirm the app displays the setup state.
-7. In Meta App Dashboard, configure callback `https://inbox.elitegoldsignal.com/webhooks/whatsapp`, use the same `WA_VERIFY_TOKEN`, and subscribe the WABA's `messages` field. The callback must be publicly reachable over HTTPS.
-8. Sign in, click **Sync numbers from Meta**, and confirm the new phone appears in the number list. The app learns the Meta Phone Number ID from the WABA response; it does not need a separate hard-coded ID.
-9. Perform a controlled inbound and outbound message check. Confirm webhook events update message status, then review Hostinger runtime logs and MySQL records. Start customer traffic only after those checks succeed.
+   Click **Verify and save**, then subscribe the **messages** field.
+4. Make sure the app is subscribed to the WABA. In WhatsApp Manager this usually happens automatically. Otherwise, call `POST /{WABA_ID}/subscribed_apps` once with the system-user token.
+5. Create at least one template (e.g. a simple greeting) and wait for approval. You need one to start conversations.
 
-## Operational constraints and remaining work
+## 3. Go-live checks (together)
 
-- Hostinger managed Node.js plans run a web process but do not support inbound WebSockets or always-running background workers. The inbox refreshes by polling; webhook writes happen during the HTTP request. Keep each webhook request small and acknowledge only after its data is committed.
-- Hostinger stops requests after 120 seconds. The app's Meta requests have shorter timeouts, and number synchronization paginates in pages of 100.
-- The deployment contains personal message data in MySQL. Set and verify automated database backups, retention, restoration, and access restrictions in hPanel before live customer use. The current app does not schedule these itself.
-- Current message composer sends text only. Add approved templates for business-initiated messages outside the customer-service window before relying on the app for outbound campaigns or follow-ups.
-- The first release has one administrator. Do not share the single admin account with multiple people; multi-user access and audit records need a later release.
-- The user's `+44` line and supplied Meta Phone Number ID are not proof the number is registered or attached to the WABA. Registration and number sync must confirm that through Meta.
-- Do not paste Hostinger, Meta, or MySQL passwords, tokens, app secrets, or SSH private keys into chat. Enter them directly into Hostinger's private environment settings.
+1. Sign in → Numbers → **Sync numbers from Meta**. Confirm the new number appears with Phone Number ID `1148479081159296`.
+2. From a personal phone, message the business number. It should appear in the inbox within about 8 seconds.
+3. Reply from the inbox and watch the status go from ✓ sent to ✓✓ delivered to ✓✓ read.
+4. Send a photo from the phone and confirm it displays.
+5. Start a new conversation with the approved template to a second test phone.
+6. Run a backup over SSH (`npm run backup`) and check the file in `BACKUP_DIR`.
+7. Check the app logs in hPanel for errors.
 
-Hostinger references: [Create a Node.js web app](https://www.hostinger.com/support/how-to-deploy-a-nodejs-website-in-hostinger/), [Connect MySQL to Node.js](https://www.hostinger.com/support/connecting-a-hostinger-mysql-database-to-a-node-js-application/), [Node.js version selection](https://www.hostinger.com/support/how-to-select-the-node-js-version-for-your-application/), and [Node.js plan limits](https://www.hostinger.com/support/hostinger-node-js-limits-for-web-and-cloud-plans/).
+## Backups and retention
+
+- Hostinger's own backups of the database are a safety net only. Also run the app's backup.
+- If hPanel → Advanced → Cron Jobs is available, add a daily job:
+  `cd <app folder> && node scripts/backup.mjs && node scripts/maintenance.mjs`
+  Use the full `node` path if cron can't find it (`which node` over SSH).
+- To restore: `node scripts/restore.mjs <file> --yes`. Restore runs in a single transaction and rolls back fully if the file is truncated or invalid.
+- `MESSAGE_RETENTION_DAYS` (optional) deletes older messages during maintenance.
+
+## Constraints
+
+- Hostinger managed Node.js has no WebSockets or background workers. The inbox polls, and webhooks are stored before the 200 response, so Meta retries on any failure and duplicate deliveries are ignored.
+- Requests are stopped after 120 seconds. Graph calls time out sooner: 20 s, and 60 s for media.
+- Throughput at 100+ numbers is unproven on this plan. Watch CPU and entry-process limits in hPanel once traffic starts.
