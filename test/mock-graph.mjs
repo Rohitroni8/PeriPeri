@@ -29,7 +29,11 @@ globalThis.fetch = async (input, init = {}) => {
   record({ method, host: url.hostname, path: url.pathname, query: Object.fromEntries(url.searchParams), auth, body });
   if (auth !== `Bearer ${process.env.WA_ACCESS_TOKEN}`) return json(401, { error: { message: 'Invalid OAuth access token', code: 190 } });
 
-  if (url.hostname === 'lookaside.fbsbx.com') return new Response(Buffer.from('FAKEJPEGBYTES'), { status: 200, headers: { 'content-type': 'image/jpeg', 'content-length': '13' } });
+  if (url.hostname === 'lookaside.fbsbx.com') {
+    // MOCK_MEDIA_FILE lets the demo show a real picture; tests use fixed bytes.
+    if (process.env.MOCK_MEDIA_FILE) return new Response(fs.readFileSync(process.env.MOCK_MEDIA_FILE), { status: 200, headers: { 'content-type': 'image/png' } });
+    return new Response(Buffer.from('FAKEJPEGBYTES'), { status: 200, headers: { 'content-type': 'image/jpeg', 'content-length': '13' } });
+  }
 
   const [, , objectId, edge] = url.pathname.split('/');
   if (edge === 'phone_numbers') {
