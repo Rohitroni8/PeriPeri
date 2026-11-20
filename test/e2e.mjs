@@ -1,17 +1,23 @@
-// End-to-end test: starts the real app against a real MySQL/MariaDB database,
-// with Meta's Graph API replaced by test/mock-graph.mjs.
-// Usage: DB_HOST=127.0.0.1 DB_USER=... DB_PASSWORD=... DB_NAME=relaydesk_test node test/e2e.mjs
+// End-to-end test: starts the real app against a real MongoDB server, with
+// Meta's Graph API replaced by test/mock-graph.mjs.
+// Usage: npm test   (starts a throwaway MongoDB replica set, like Atlas)
+//    or: MONGODB_URI=mongodb://... node test/e2e.mjs   (uses database relaydesk_test, which it wipes)
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
-import mysql from 'mysql2/promise';
+import { MongoClient, BSON } from 'mongodb';
+const { EJSON } = BSON;
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-if (!/test/i.test(process.env.DB_NAME || '')) throw new Error('Refusing to run: DB_NAME must contain "test" because this suite wipes the database.');
+const memory = process.env.MONGODB_URI ? null : await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+const MONGODB_URI = process.env.MONGODB_URI || memory.getUri();
+const DB_NAME = 'relaydesk_test';
 
 const work = fs.mkdtempSync(path.join(os.tmpdir(), 'relaydesk-e2e-'));
 const graphLog = path.join(work, 'graph.log');
@@ -19,7 +25,7 @@ const PORT = 18000 + Math.floor(Math.random() * 1000);
 const BASE = `http://127.0.0.1:${PORT}`;
 const ORIGIN = BASE;
 const env = {
-  ...process.env,
+  ...process.env, MONGODB_URI, MONGODB_DB: DB_NAME,
   NODE_ENV: 'production', PORT: String(PORT), HOST: '127.0.0.1',
   ADMIN_EMAIL: 'admin@example.test', ADMIN_PASSWORD: 'correct-horse-battery-staple',
   WA_VERIFY_TOKEN: 'verify-me', META_APP_SECRET: 'app-secret-for-tests',
@@ -27,11 +33,14 @@ const env = {
   MOCK_GRAPH_LOG: graphLog, BACKUP_DIR: path.join(work, 'backups'), BACKUP_KEEP: '2'
 };
 const PHONE = '1148479081159296';
+// Async on purpose: the in-process test MongoDB logs through this process, and
+// a blocking execFileSync would stall it.
+const run = async (args, extraEnv = {}) => (await promisify(execFile)(process.execPath, args, { cwd: root, env: { ...env, ...extraEnv }, timeout: 60000 })).stdout;
 
-const db = await mysql.createConnection({ host: env.DB_HOST, port: Number(env.DB_PORT || 3306), user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME });
-await db.query('SET FOREIGN_KEY_CHECKS=0');
-for (const t of ['messages', 'conversations', 'contacts', 'phone_numbers', 'sessions']) await db.query(`DROP TABLE IF EXISTS \`${t}\``);
-await db.query('SET FOREIGN_KEY_CHECKS=1');
+const mongo = await MongoClient.connect(MONGODB_URI);
+const db = mongo.db(DB_NAME);
+await db.dropDatabase();
+const messageRow = (filter, sort = { _id: -1 }) => db.collection('messages').findOne(filter, { sort, projection: { _id: 0, status: 1, error_code: 1, error_title: 1 } });
 
 let passed = 0;
 const results = [];
@@ -84,10 +93,12 @@ try {
     assert.match(r.headers.get('strict-transport-security'), /max-age/);
   });
 
-  await step('schema created with all tables and added columns', async () => {
-    const [cols] = await db.query("SELECT COLUMN_NAME c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME IN ('messages','conversations')");
-    const names = cols.map(c => c.c);
-    for (const c of ['media_id', 'media_mime', 'error_title', 'last_inbound_at']) assert.ok(names.includes(c), c);
+  await step('indexes created (unique WhatsApp IDs, contacts, conversations, session expiry)', async () => {
+    const names = async c => (await db.collection(c).indexes()).map(i => i.name);
+    assert.ok((await names('messages')).includes('messages_wa_id'));
+    assert.ok((await names('contacts')).includes('contacts_wa_id'));
+    assert.ok((await names('conversations')).includes('conversation_phone_contact'));
+    assert.ok((await names('sessions')).includes('sessions_ttl'));
   });
 
   await step('static UI served with CSP; unknown paths 404; traversal rejected', async () => {
@@ -126,8 +137,7 @@ try {
     assert.equal((await webhook(inbound('wamid.X', '447700900001', 'hi'), 'wrong-secret')).status, 401);
     const unsigned = await fetch(`${BASE}/webhooks/whatsapp`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(inbound('wamid.X', '447700900001', 'hi')) });
     assert.equal(unsigned.status, 401);
-    const [[{ n }]] = await db.query('SELECT COUNT(*) n FROM messages');
-    assert.equal(Number(n), 0);
+    assert.equal(await db.collection('messages').countDocuments(), 0);
   });
 
   let convA;
@@ -205,14 +215,11 @@ try {
   await step('status webhooks never move backwards; failures record error', async () => {
     await webhook(status(outId, 'delivered'));
     await webhook(status(outId, 'sent'));
-    let [[m]] = await db.query('SELECT status FROM messages WHERE wa_message_id=?', [outId]);
-    assert.equal(m.status, 'delivered');
+    assert.equal((await messageRow({ wa_message_id: outId })).status, 'delivered');
     await webhook(status(outId, 'read'));
-    [[m]] = await db.query('SELECT status FROM messages WHERE wa_message_id=?', [outId]);
-    assert.equal(m.status, 'read');
+    assert.equal((await messageRow({ wa_message_id: outId })).status, 'read');
     await webhook(status(outId, 'failed', { errors: [{ code: 131049, title: 'Not delivered to maintain ecosystem health' }] }));
-    [[m]] = await db.query('SELECT status, error_code, error_title FROM messages WHERE wa_message_id=?', [outId]);
-    assert.deepEqual({ ...m }, { status: 'failed', error_code: '131049', error_title: 'Not delivered to maintain ecosystem health' });
+    assert.deepEqual(await messageRow({ wa_message_id: outId }), { status: 'failed', error_code: '131049', error_title: 'Not delivered to maintain ecosystem health' });
   });
 
   let convOld;
@@ -260,8 +267,8 @@ try {
     assert.equal(conv.wa_id, '447700900123'); assert.equal(conv.window_open, false);
     const fail = await call('POST', '/api/conversations', { phone_number_id: PHONE, to: '+44 0000 000000', template: { name: 'hello', language: 'en_US' } });
     assert.equal(fail.status, 502); assert.equal(fail.data.code, '131026');
-    const [[m]] = await db.query("SELECT status, error_code FROM messages WHERE direction='outbound' ORDER BY id DESC LIMIT 1");
-    assert.deepEqual({ ...m }, { status: 'failed', error_code: '131026' });
+    const m = await messageRow({ direction: 'outbound' });
+    assert.deepEqual({ status: m.status, error_code: m.error_code }, { status: 'failed', error_code: '131026' });
   });
 
   await step('close / reopen conversation and state filters', async () => {
@@ -278,6 +285,12 @@ try {
     assert.equal((await call('GET', `/api/conversations?state=all&phone=${PHONE}`)).data.conversations.length, 4, 'includes the conversation whose first template failed');
     assert.equal((await call('GET', '/api/conversations?state=all&phone=100000000000001')).data.conversations.length, 0);
     assert.equal((await call('GET', '/api/conversations?state=all&q=900002')).data.conversations.length, 1);
+    const odd = await call('GET', `/api/conversations?state=all&q=${encodeURIComponent('(.*[')}`);
+    assert.equal(odd.status, 200); assert.equal(odd.data.conversations.length, 0, 'search text is matched literally, not as a regex');
+    await webhook(inbound('wamid.DOLLAR', '447700900003', '$set price $100', nowSec(), 'Dollar Customer'));
+    const dollar = (await call('GET', '/api/conversations?q=Dollar')).data.conversations[0];
+    assert.equal(dollar.last_message_preview, '$set price $100', 'text starting with $ is stored as text');
+    await call('POST', `/api/conversations/${dollar.id}/state`, { state: 'closed' });
   });
 
   await step('mutating API calls from a foreign origin are rejected', async () => {
@@ -287,27 +300,25 @@ try {
 
   await step('overview counts', async () => {
     const o = (await call('GET', '/api/overview')).data;
-    assert.equal(o.conversations, 4); assert.equal(o.numbers, 3); assert.equal(o.whatsapp_configured, true);
+    assert.equal(o.conversations, 5); assert.equal(o.numbers, 3); assert.equal(o.whatsapp_configured, true);
   });
 
   await step('backup → wipe → restore drill reproduces data exactly', async () => {
     const snapshot = async () => {
       const out = {};
-      for (const t of ['phone_numbers', 'contacts', 'conversations', 'messages']) [out[t]] = await db.query(`SELECT * FROM \`${t}\` ORDER BY 1`);
-      return JSON.stringify(out);
+      for (const t of ['phone_numbers', 'contacts', 'conversations', 'messages']) out[t] = await db.collection(t).find().sort({ _id: 1 }).toArray();
+      return EJSON.stringify(out, { relaxed: false });
     };
     const before = await snapshot();
-    execFileSync(process.execPath, ['scripts/backup.mjs'], { cwd: root, env, stdio: 'pipe' });
-    execFileSync(process.execPath, ['scripts/backup.mjs'], { cwd: root, env, stdio: 'pipe' });
-    execFileSync(process.execPath, ['scripts/backup.mjs'], { cwd: root, env, stdio: 'pipe' });
+    await run(['scripts/backup.mjs']);
+    await run(['scripts/backup.mjs']);
+    await run(['scripts/backup.mjs']);
     const files = fs.readdirSync(env.BACKUP_DIR).sort();
     assert.equal(files.length, 2, 'retention keeps BACKUP_KEEP files');
     assert.equal(fs.statSync(path.join(env.BACKUP_DIR, files[1])).mode & 0o777, 0o600);
-    await db.query('SET FOREIGN_KEY_CHECKS=0');
-    await db.query('DELETE FROM messages'); await db.query('DELETE FROM conversations');
-    await db.query('SET FOREIGN_KEY_CHECKS=1');
-    assert.throws(() => execFileSync(process.execPath, ['scripts/restore.mjs', path.join(env.BACKUP_DIR, files[1])], { cwd: root, env, stdio: 'pipe' }), 'requires --yes');
-    const out = execFileSync(process.execPath, ['scripts/restore.mjs', path.join(env.BACKUP_DIR, files[1]), '--yes'], { cwd: root, env, stdio: 'pipe' }).toString();
+    await db.collection('messages').deleteMany({}); await db.collection('conversations').deleteMany({});
+    await assert.rejects(run(['scripts/restore.mjs', path.join(env.BACKUP_DIR, files[1])]), 'requires --yes');
+    const out = await run(['scripts/restore.mjs', path.join(env.BACKUP_DIR, files[1]), '--yes']);
     assert.match(out, /Restored backup/);
     assert.equal(await snapshot(), before);
     // A truncated backup must not destroy current data.
@@ -315,20 +326,22 @@ try {
     const zlib = await import('node:zlib');
     const lines = zlib.gunzipSync(fs.readFileSync(path.join(env.BACKUP_DIR, files[1]))).toString().trim().split('\n');
     fs.writeFileSync(truncated, zlib.gzipSync(lines.slice(0, -2).join('\n')));
-    assert.throws(() => execFileSync(process.execPath, ['scripts/restore.mjs', truncated, '--yes'], { cwd: root, env, stdio: 'pipe' }));
-    assert.equal(await snapshot(), before, 'failed restore rolled back');
+    await assert.rejects(run(['scripts/restore.mjs', truncated, '--yes']));
+    assert.equal(await snapshot(), before, 'failed restore left data untouched');
+    // New messages continue after the highest restored ID.
+    const top = await db.collection('messages').find().sort({ _id: -1 }).limit(1).next();
+    assert.equal((await db.collection('counters').findOne({ _id: 'messages' })).seq, top._id);
   });
 
   await step('maintenance applies message retention', async () => {
-    await db.query("UPDATE messages SET sent_at='2020-01-01T00:00:00.000Z' WHERE wa_message_id='wamid.IN0'");
-    const out = execFileSync(process.execPath, ['scripts/maintenance.mjs'], { cwd: root, env: { ...env, MESSAGE_RETENTION_DAYS: '365' }, stdio: 'pipe' }).toString();
+    await db.collection('messages').updateOne({ wa_message_id: 'wamid.IN0' }, { $set: { sent_at: '2020-01-01T00:00:00.000Z' } });
+    const out = await run(['scripts/maintenance.mjs'], { MESSAGE_RETENTION_DAYS: '365' });
     assert.match(out, /removed: 1/);
-    const [[{ n }]] = await db.query("SELECT COUNT(*) n FROM messages WHERE wa_message_id='wamid.IN0'");
-    assert.equal(Number(n), 0);
+    assert.equal(await db.collection('messages').countDocuments({ wa_message_id: 'wamid.IN0' }), 0);
   });
 
   await step('sync-numbers CLI works', async () => {
-    const out = execFileSync(process.execPath, ['--import', './test/mock-graph.mjs', 'sync-numbers.mjs'], { cwd: root, env, stdio: 'pipe' }).toString();
+    const out = await run(['--import', './test/mock-graph.mjs', 'sync-numbers.mjs']);
     assert.match(out, /Synced 3 phone-number records across 2 page/);
   });
 
@@ -352,7 +365,8 @@ try {
 } finally {
   app.kill('SIGTERM');
   await exited;
-  await db.end();
+  await mongo.close();
+  await memory?.stop();
   fs.rmSync(work, { recursive: true, force: true });
   console.log(results.join('\n'));
   console.log(`\n${passed} passed${process.exitCode ? ', 1 failed' : ''}`);

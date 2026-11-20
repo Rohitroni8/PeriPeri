@@ -1,35 +1,37 @@
 // Runs Relaydesk locally with the simulated Meta API and sample conversations,
 // so the interface can be explored without a real WhatsApp number.
-// Usage: DB_HOST=127.0.0.1 DB_USER=... DB_PASSWORD=... DB_NAME=relaydesk_demo node test/demo.mjs
+// Usage: npm run demo   (starts a throwaway MongoDB; nothing is kept)
+//    or: MONGODB_URI=mongodb://... npm run demo   (uses and resets database relaydesk_demo)
 // Sign in with demo@relaydesk.test / demo-password-2026 (override with DEMO_EMAIL / DEMO_PASSWORD).
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import mysql from 'mysql2/promise';
+import { MongoClient } from 'mongodb';
+import { MongoMemoryReplSet } from 'mongodb-memory-server';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-if (!/demo|test/i.test(process.env.DB_NAME || '')) throw new Error('Refusing to run: DB_NAME must contain "demo" or "test" because the demo resets the database.');
+const memory = process.env.MONGODB_URI ? null : await MongoMemoryReplSet.create({ replSet: { count: 1 } });
+const MONGODB_URI = process.env.MONGODB_URI || memory.getUri();
 const PORT = Number(process.env.PORT || 8787);
 const BASE = `http://127.0.0.1:${PORT}`;
 const SECRET = 'demo-app-secret';
 const PHONE = '1148479081159296';
 const env = {
-  ...process.env, NODE_ENV: 'development', PORT: String(PORT), HOST: process.env.HOST || '0.0.0.0',
+  ...process.env, MONGODB_URI, MONGODB_DB: 'relaydesk_demo', NODE_ENV: 'development', PORT: String(PORT), HOST: process.env.HOST || '0.0.0.0',
   ADMIN_EMAIL: process.env.DEMO_EMAIL || 'demo@relaydesk.test', ADMIN_PASSWORD: process.env.DEMO_PASSWORD || 'demo-password-2026',
   WA_VERIFY_TOKEN: 'demo-verify', META_APP_SECRET: SECRET, WA_BUSINESS_ACCOUNT_ID: '999000111',
   WA_ACCESS_TOKEN: 'demo-token', WA_GRAPH_API_VERSION: 'v99.0'
 };
 
-const db = await mysql.createConnection({ host: env.DB_HOST, port: Number(env.DB_PORT || 3306), user: env.DB_USER, password: env.DB_PASSWORD, database: env.DB_NAME });
-await db.query('SET FOREIGN_KEY_CHECKS=0');
-for (const t of ['messages', 'conversations', 'contacts', 'phone_numbers', 'sessions']) await db.query(`DROP TABLE IF EXISTS \`${t}\``);
-await db.end();
+const mongo = await MongoClient.connect(MONGODB_URI);
+await mongo.db('relaydesk_demo').dropDatabase();
+await mongo.close();
 
 const app = spawn(process.execPath, ['--import', './test/mock-graph.mjs', 'app.mjs'], { cwd: root, env, stdio: 'inherit' });
 process.on('SIGINT', () => app.kill('SIGINT'));
 process.on('SIGTERM', () => app.kill('SIGTERM'));
-app.on('exit', code => process.exit(code ?? 0));
+app.on('exit', async code => { await memory?.stop(); process.exit(code ?? 0); });
 for (let i = 0; i < 100; i += 1) { try { if ((await fetch(`${BASE}/health`)).ok) break; } catch { /* starting */ } await new Promise(r => setTimeout(r, 100)); }
 
 const now = Math.floor(Date.now() / 1000);

@@ -5,9 +5,9 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { loadEnv } from './lib/env.mjs';
-import { createPool, initializeDatabase } from './lib/db.mjs';
+import { connect, initializeDatabase } from './lib/db.mjs';
 import { graphConfigured, syncNumbers, listTemplates, clearTemplateCache, downloadMedia } from './lib/graph.mjs';
-import { processWebhook, conversationList, sendText, sendTemplate, startConversation, withWindow } from './lib/inbox.mjs';
+import { processWebhook, conversationList, getConversation, sendText, sendTemplate, startConversation } from './lib/inbox.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 await loadEnv(path.join(here, '.env'));
@@ -31,8 +31,9 @@ if (PRODUCTION && (!ADMIN_EMAIL || ADMIN_PASSWORD.length < 16)) {
   throw new Error('Production requires ADMIN_EMAIL and a unique ADMIN_PASSWORD of at least 16 characters.');
 }
 
-const db = createPool();
+const { client, db } = await connect();
 await initializeDatabase(db);
+const sessions = db.collection('sessions');
 const adminPasswordHash = ADMIN_PASSWORD.length >= 12 ? await scrypt(ADMIN_PASSWORD, 'relaydesk-admin-v1') : null;
 const loginAttempts = new Map();
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -111,10 +112,9 @@ async function requireSession(req) {
   const token = cookieValue(req, COOKIE_NAME);
   if (!token || token.length > 200) return false;
   const hash = crypto.createHash('sha256').update(token).digest('hex');
-  const [rows] = await db.execute('SELECT expires_at FROM sessions WHERE token_hash = ?', [hash]);
-  const row = rows[0];
+  const row = await sessions.findOne({ _id: hash });
   if (!row || Number(row.expires_at) < Date.now()) {
-    if (row) await db.execute('DELETE FROM sessions WHERE token_hash = ?', [hash]);
+    if (row) await sessions.deleteOne({ _id: hash });
     return false;
   }
   return true;
@@ -152,7 +152,7 @@ async function serveStatic(url, res) {
 const INLINE_MEDIA = /^(image\/(jpeg|png|webp|gif)|audio\/[\w.+-]+|video\/(mp4|3gpp))$/;
 
 async function serveMedia(res, messageId) {
-  const [[message]] = await db.execute('SELECT media_id, media_mime, media_filename FROM messages WHERE id=?', [messageId]);
+  const message = await db.collection('messages').findOne({ _id: messageId }, { projection: { media_id: 1, media_mime: 1, media_filename: 1 } });
   if (!message?.media_id) return respond(res, 404, { error: 'media_not_found' });
   const { response, mime } = await downloadMedia(message.media_id);
   const type = String(message.media_mime || mime).split(';')[0].trim().toLowerCase();
@@ -170,12 +170,13 @@ async function serveMedia(res, messageId) {
 }
 
 async function overview() {
-  const [[totals]] = await db.query(`SELECT COUNT(*) AS conversations,
-    COALESCE(SUM(CASE WHEN unread_count>0 THEN 1 ELSE 0 END),0) AS unread,
-    COALESCE(SUM(CASE WHEN state='open' THEN 1 ELSE 0 END),0) AS open FROM conversations`);
-  const [[numbers]] = await db.query('SELECT COUNT(*) AS count FROM phone_numbers');
+  const conversations = db.collection('conversations');
+  const [total, unread, open, numbers] = await Promise.all([
+    conversations.estimatedDocumentCount(), conversations.countDocuments({ unread_count: { $gt: 0 } }),
+    conversations.countDocuments({ state: 'open' }), db.collection('phone_numbers').estimatedDocumentCount()
+  ]);
   return {
-    conversations: Number(totals.conversations), unread: Number(totals.unread), open: Number(totals.open), numbers: Number(numbers.count),
+    conversations: total, unread, open, numbers,
     whatsapp_configured: graphConfigured(), webhook_configured: Boolean(VERIFY_TOKEN && APP_SECRET)
   };
 }
@@ -200,8 +201,7 @@ async function handleLogin(req, res) {
   loginAttempts.delete(ip);
   const token = crypto.randomBytes(32).toString('base64url');
   const hash = crypto.createHash('sha256').update(token).digest('hex');
-  await db.execute('DELETE FROM sessions WHERE expires_at < ?', [now]);
-  await db.execute('INSERT INTO sessions(token_hash, expires_at, created_at) VALUES(?,?,?)', [hash, now + SESSION_TTL_MS, now]);
+  await sessions.insertOne({ _id: hash, expires_at: now + SESSION_TTL_MS, expire_at: new Date(now + SESSION_TTL_MS), created_at: now });
   setSessionCookie(res, token, Math.floor(SESSION_TTL_MS / 1000));
   return respond(res, 200, { authenticated: true, email: ADMIN_EMAIL });
 }
@@ -233,20 +233,20 @@ async function handleApi(req, res, url) {
   if (conversationMatch) {
     const id = Number(conversationMatch[1]);
     const action = conversationMatch[2];
+    const conversations = db.collection('conversations');
     if (req.method === 'GET' && !action) {
-      const [[row]] = await db.execute(`SELECT c.id, c.phone_number_id, c.last_message_at, c.last_inbound_at, c.state, c.unread_count,
-        p.display_phone_number, t.wa_id, t.profile_name FROM conversations c JOIN contacts t ON t.id=c.contact_id
-        LEFT JOIN phone_numbers p ON p.phone_number_id=c.phone_number_id WHERE c.id=?`, [id]);
-      return row ? respond(res, 200, { conversation: withWindow(row) }) : respond(res, 404, { error: 'conversation_not_found' });
+      const row = await getConversation(db, id);
+      return row ? respond(res, 200, { conversation: row }) : respond(res, 404, { error: 'conversation_not_found' });
     }
     if (req.method === 'GET' && action === 'messages') {
-      const [exists] = await db.execute('SELECT id FROM conversations WHERE id=?', [id]);
-      if (!exists.length) return respond(res, 404, { error: 'conversation_not_found' });
-      await db.execute('UPDATE conversations SET unread_count=0 WHERE id=?', [id]);
-      const [messages] = await db.execute(`SELECT id, wa_message_id, direction, message_type, body, media_mime, media_filename,
-        (media_id IS NOT NULL) AS has_media, status, error_code, error_title, sent_at
-        FROM messages WHERE conversation_id=? ORDER BY sent_at DESC, id DESC LIMIT 200`, [id]);
-      return respond(res, 200, { messages: messages.reverse().map(m => ({ ...m, has_media: Boolean(Number(m.has_media)) })) });
+      const found = await conversations.updateOne({ _id: id }, { $set: { unread_count: 0 } });
+      if (!found.matchedCount) return respond(res, 404, { error: 'conversation_not_found' });
+      const messages = await db.collection('messages').find({ conversation_id: id }).sort({ sent_at: -1, _id: -1 }).limit(200).toArray();
+      return respond(res, 200, { messages: messages.reverse().map(m => ({
+        id: m._id, wa_message_id: m.wa_message_id, direction: m.direction, message_type: m.message_type, body: m.body,
+        media_mime: m.media_mime ?? null, media_filename: m.media_filename ?? null, has_media: Boolean(m.media_id),
+        status: m.status, error_code: m.error_code ?? null, error_title: m.error_title ?? null, sent_at: m.sent_at
+      })) });
     }
     if (req.method === 'POST' && action === 'messages') {
       const body = await readJsonBody(req);
@@ -263,9 +263,8 @@ async function handleApi(req, res, url) {
     if (req.method === 'POST' && action === 'state') {
       const body = await readJsonBody(req);
       if (!['open', 'closed'].includes(body.state)) return respond(res, 400, { error: 'Invalid conversation state.' });
-      const [exists] = await db.execute('SELECT id FROM conversations WHERE id=?', [id]);
-      if (!exists.length) return respond(res, 404, { error: 'conversation_not_found' });
-      await db.execute('UPDATE conversations SET state=?, updated_at=? WHERE id=?', [body.state, new Date().toISOString(), id]);
+      const updated = await conversations.updateOne({ _id: id }, { $set: { state: body.state, updated_at: new Date().toISOString() } });
+      if (!updated.matchedCount) return respond(res, 404, { error: 'conversation_not_found' });
       return respond(res, 200, { id, state: body.state });
     }
   }
@@ -281,10 +280,14 @@ async function handleApi(req, res, url) {
     catch (error) { return errorResponse(res, error, 400); }
   }
   if (req.method === 'GET' && url.pathname === '/api/numbers') {
-    const [numbers] = await db.execute(`SELECT p.phone_number_id, p.display_phone_number, p.verified_name, p.quality_rating, p.status, p.updated_at,
-      (SELECT COUNT(*) FROM conversations c WHERE c.phone_number_id=p.phone_number_id AND c.state='open') AS open_conversations
-      FROM phone_numbers p ORDER BY COALESCE(p.display_phone_number, p.phone_number_id)`);
-    return respond(res, 200, { numbers: numbers.map(n => ({ ...n, open_conversations: Number(n.open_conversations) })), configured: graphConfigured() });
+    const [numbers, openCounts] = await Promise.all([
+      db.collection('phone_numbers').find().toArray(),
+      db.collection('conversations').aggregate([{ $match: { state: 'open' } }, { $group: { _id: '$phone_number_id', n: { $sum: 1 } } }]).toArray()
+    ]);
+    const open = new Map(openCounts.map(row => [row._id, row.n]));
+    const rows = numbers.map(({ _id, ...n }) => ({ phone_number_id: _id, ...n, open_conversations: open.get(_id) || 0 }))
+      .sort((a, b) => String(a.display_phone_number || a.phone_number_id).localeCompare(String(b.display_phone_number || b.phone_number_id)));
+    return respond(res, 200, { numbers: rows, configured: graphConfigured() });
   }
   if (req.method === 'POST' && url.pathname === '/api/numbers/sync') {
     try { const result = await syncNumbers(db); clearTemplateCache(); return respond(res, 200, result); }
@@ -299,7 +302,7 @@ const server = http.createServer(async (req, res) => {
   catch { return respond(res, 400, { error: 'invalid_url' }); }
   try {
     if (req.method === 'GET' && url.pathname === '/health') {
-      await db.query('SELECT 1');
+      await db.command({ ping: 1 });
       return respond(res, 200, { status: 'ok', database: 'ok', whatsapp_configured: graphConfigured(), webhook_configured: Boolean(VERIFY_TOKEN && APP_SECRET) });
     }
 
@@ -329,7 +332,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/api/auth/logout' && req.method === 'POST') {
       if (!sameOrigin(req)) return respond(res, 403, { error: 'origin_rejected' });
       const token = cookieValue(req, COOKIE_NAME);
-      if (token) await db.execute('DELETE FROM sessions WHERE token_hash=?', [crypto.createHash('sha256').update(token).digest('hex')]);
+      if (token) await sessions.deleteOne({ _id: crypto.createHash('sha256').update(token).digest('hex') });
       setSessionCookie(res, '', 0);
       return respond(res, 200, { authenticated: false });
     }
@@ -352,12 +355,12 @@ const server = http.createServer(async (req, res) => {
 server.headersTimeout = 15000;
 server.requestTimeout = 90000;
 server.keepAliveTimeout = 5000;
-server.listen(PORT, HOST, () => console.log(`Relaydesk listening on ${HOST}:${PORT}; MySQL database ready.`));
+server.listen(PORT, HOST, () => console.log(`Relaydesk listening on ${HOST}:${PORT}; MongoDB ready.`));
 
 async function shutdown(signal) {
   console.log(`Received ${signal}; closing server.`);
   server.close(async error => {
-    try { await db.end(); } finally { process.exit(error ? 1 : 0); }
+    try { await client.close(); } finally { process.exit(error ? 1 : 0); }
   });
   setTimeout(() => process.exit(1), 10000).unref();
 }

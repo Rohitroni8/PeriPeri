@@ -4,7 +4,7 @@ Relaydesk is a WhatsApp shared inbox built on Meta's official WhatsApp Business 
 
 ## What it does
 
-- One administrator sign-in (secure, HttpOnly session cookie stored in MySQL; login throttling).
+- One administrator sign-in (secure, HttpOnly session cookie stored in MongoDB; login throttling).
 - Receives messages through Meta's signed webhook: text, replies, reactions, locations, shared contacts, and media (image, audio, video, document, sticker).
 - Shows media through an authenticated proxy. Files are fetched from Meta on demand and are not stored on the server. Meta keeps inbound media for a limited time only.
 - Free-form text replies inside WhatsApp's 24-hour customer-service window. The UI shows how long the window stays open.
@@ -19,33 +19,35 @@ Relaydesk is a WhatsApp shared inbox built on Meta's official WhatsApp Business 
 | Path | Purpose |
 |---|---|
 | `app.mjs` | HTTP server, routes, auth, webhook |
-| `lib/db.mjs` | MySQL pool, schema creation and additive migrations |
+| `lib/db.mjs` | MongoDB (Atlas) connection, indexes, numeric ID counters |
 | `lib/graph.mjs` | Meta Graph API client: number sync, templates, send, media |
 | `lib/inbox.mjs` | Webhook processing, conversations, sending rules |
 | `public/` | Browser UI (no build step) |
 | `sync-numbers.mjs` | CLI number sync |
 | `scripts/backup.mjs`, `scripts/restore.mjs`, `scripts/maintenance.mjs` | Operations |
-| `test/e2e.mjs`, `test/mock-graph.mjs` | End-to-end tests against a real MySQL/MariaDB database with a mocked Graph API |
+| `test/e2e.mjs`, `test/mock-graph.mjs` | End-to-end tests against a real MongoDB server with a mocked Graph API |
+| `test/demo.mjs` | Local demo with sample conversations and a simulated Meta API (`npm run demo`) |
 
 ## Local setup
 
-1. Use Node.js 22 or later and create a MySQL or MariaDB database.
-2. Copy `.env.example` to `.env`. Fill in the database settings and an admin email and password (at least 16 characters when `NODE_ENV=production`).
-3. Run `npm install`, then `npm start`. Tables are created and migrated at startup.
+1. Use Node.js 22 or later and a MongoDB database (MongoDB Atlas, or MongoDB 6.0+ of your own).
+2. Copy `.env.example` to `.env`. Fill in `MONGODB_URI` and an admin email and password (at least 16 characters when `NODE_ENV=production`).
+3. Run `npm install`, then `npm start`. Collections and indexes are created at startup.
 4. Open `http://localhost:8787`.
 
 ## Tests
 
 ```bash
-DB_HOST=127.0.0.1 DB_USER=... DB_PASSWORD=... DB_NAME=relaydesk_test npm test
+npm test
 ```
 
-The suite wipes the database, so it refuses to run unless `DB_NAME` contains "test". It starts the real app in production mode and covers these areas:
+The suite downloads and starts a temporary MongoDB replica set (the same setup as Atlas) through `mongodb-memory-server`, so it needs no database of yours. To run it against another server, set `MONGODB_URI`; it then uses and wipes the database `relaydesk_test` only. It starts the real app in production mode and covers these areas:
 
 - **Sign-in:** login, origin checks, throttling.
 - **Webhooks:** signature verification, idempotent redelivery, out-of-order messages and statuses.
 - **Messaging:** media proxy, number sync pagination and token stripping, 24-hour window enforcement, template validation and sending, new conversations, failed-send recording.
-- **Operations:** backup → wipe → restore drill, truncated-backup rollback, retention.
+- **Operations:** backup → wipe → restore drill, truncated backup leaves data untouched, ID counters continue after restore, retention.
+- **MongoDB safety:** search text and message text are treated literally, never as query operators or regexes.
 
 ## API routes
 
@@ -69,4 +71,4 @@ The suite wipes the database, so it refuses to run unless `DB_NAME` contains "te
 
 Webhooks are processed synchronously, and inserts are idempotent, so Meta's retries are safe. It has not been load-tested at 100+ numbers.
 
-See `DEPLOYMENT.md` for the Hostinger checklist.
+See `DEPLOYMENT.md` for the local-server and MongoDB Atlas checklist.

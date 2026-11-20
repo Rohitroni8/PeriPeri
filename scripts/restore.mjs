@@ -1,12 +1,18 @@
-// Replaces the Relaydesk tables with the contents of a backup file.
+// Replaces the Relaydesk collections with the contents of a backup file.
 // Usage: node scripts/restore.mjs <backup.ndjson.gz> --yes
+//
+// The backup is loaded into temporary collections and checked first; the live
+// collections are only swapped out once the whole file has loaded correctly,
+// so a truncated or invalid file leaves the current data untouched.
 import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
+import { BSON } from 'mongodb';
+const { EJSON } = BSON;
 import { loadEnv } from '../lib/env.mjs';
-import { createPool, initializeDatabase } from '../lib/db.mjs';
+import { connect, createIndexes } from '../lib/db.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 await loadEnv(path.join(here, '..', '.env'));
@@ -18,59 +24,56 @@ if (!file || !process.argv.includes('--yes')) {
 }
 
 const ORDER = ['phone_numbers', 'contacts', 'conversations', 'messages'];
-const pool = createPool({ connectionLimit: 2, queueLimit: 10 });
-const connection = await (async () => { await initializeDatabase(pool); return pool.getConnection(); })();
+const staging = name => `restore_tmp_${name}`;
+const { client, db } = await connect({ maxPoolSize: 2 });
 try {
-  const [cols] = await connection.query('SELECT TABLE_NAME AS t, COLUMN_NAME AS c FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE()');
-  const allowed = new Map(ORDER.map(t => [t, new Set()]));
-  for (const { t, c } of cols) allowed.get(t)?.add(c);
-
+  for (const name of ORDER) {
+    await db.collection(staging(name)).drop().catch(() => {});
+    // Unique indexes also reject a backup that contains duplicates; rename keeps them.
+    await db.createCollection(staging(name));
+    await createIndexes(db, name, staging(name));
+  }
   let header = null, footer = null;
   const counts = Object.fromEntries(ORDER.map(t => [t, 0]));
-  const batches = new Map();
-  const flush = async table => {
-    const rows = batches.get(table);
-    if (!rows?.length) return;
-    const columns = Object.keys(rows[0]);
-    await connection.query(`INSERT INTO \`${table}\` (${columns.map(c => `\`${c}\``).join(',')}) VALUES ?`, [rows.map(r => columns.map(c => r[c]))]);
-    batches.set(table, []);
+  const batches = new Map(ORDER.map(t => [t, []]));
+  const flush = async name => {
+    const docs = batches.get(name);
+    if (docs.length) await db.collection(staging(name)).insertMany(docs, { ordered: true });
+    batches.set(name, []);
   };
-
-  await connection.beginTransaction();
-  await connection.query('SET FOREIGN_KEY_CHECKS=0');
-  for (const table of [...ORDER].reverse()) await connection.query(`DELETE FROM \`${table}\``);
-  // Create the reader only now: lines emitted during the awaits above would be lost.
   const lines = readline.createInterface({ input: fs.createReadStream(file).pipe(zlib.createGunzip()), crlfDelay: Infinity });
   for await (const line of lines) {
     if (!line.trim()) continue;
-    const record = JSON.parse(line);
+    const record = EJSON.parse(line, { relaxed: true });
     if (!header) {
-      if (record.relaydesk_backup !== 1) throw new Error('Not a Relaydesk backup file.');
+      if (record.relaydesk_backup !== 2 || record.database !== 'mongodb') throw new Error('Not a Relaydesk MongoDB backup file.');
       header = record;
       continue;
     }
     if (record.end) { footer = record; continue; }
-    const columns = allowed.get(record.table);
-    if (!columns) throw new Error(`Unexpected table in backup: ${record.table}`);
-    for (const key of Object.keys(record.row)) if (!columns.has(key)) throw new Error(`Unexpected column ${record.table}.${key}`);
-    const batch = batches.get(record.table) || [];
-    if (batch.length && Object.keys(batch[0]).join() !== Object.keys(record.row).join()) await flush(record.table);
-    (batches.get(record.table) || batches.set(record.table, []).get(record.table)).push(record.row);
-    counts[record.table] += 1;
-    if (batches.get(record.table).length >= 500) await flush(record.table);
+    if (!batches.has(record.collection)) throw new Error(`Unexpected collection in backup: ${record.collection}`);
+    if (!record.doc || record.doc._id === undefined) throw new Error(`Document without _id in ${record.collection}`);
+    batches.get(record.collection).push(record.doc);
+    counts[record.collection] += 1;
+    if (batches.get(record.collection).length >= 500) await flush(record.collection);
   }
-  for (const table of ORDER) await flush(table);
+  for (const name of ORDER) await flush(name);
   if (!footer) throw new Error('Backup file is truncated (no end marker); nothing was restored.');
-  for (const table of ORDER) if ((footer.counts?.[table] ?? counts[table]) !== counts[table]) throw new Error(`Row count mismatch for ${table}.`);
-  await connection.query('SET FOREIGN_KEY_CHECKS=1');
-  await connection.commit();
+  for (const name of ORDER) if ((footer.counts?.[name] ?? counts[name]) !== counts[name]) throw new Error(`Document count mismatch for ${name}.`);
+
+  for (const name of ORDER) {
+    await db.collection(staging(name)).rename(name, { dropTarget: true });
+  }
+  // New IDs must continue after the highest restored one.
+  for (const name of ['contacts', 'conversations', 'messages']) {
+    const [top] = await db.collection(name).find({}, { projection: { _id: 1 } }).sort({ _id: -1 }).limit(1).toArray();
+    await db.collection('counters').updateOne({ _id: name }, { $set: { seq: top ? Number(top._id) : 0 } }, { upsert: true });
+  }
   console.log(`Restored backup from ${header.created_at}: ${ORDER.map(t => `${t}=${counts[t]}`).join(', ')}.`);
 } catch (error) {
-  await connection.rollback();
-  await connection.query('SET FOREIGN_KEY_CHECKS=1').catch(() => {});
-  console.error(`Restore failed and was rolled back: ${error.message}`);
+  console.error(`Restore failed; current data was not changed: ${error.message}`);
   process.exitCode = 1;
 } finally {
-  connection.release();
-  await pool.end();
+  for (const name of ORDER) await db.collection(staging(name)).drop().catch(() => {});
+  await client.close();
 }
